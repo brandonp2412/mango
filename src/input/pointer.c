@@ -117,16 +117,24 @@ static bool pointer_node_enabled(struct wlr_scene_node *node) {
 	return true;
 }
 
-/* Whether the surface a constraint belongs to is enabled in the scene tree. */
-static bool pointer_constraint_surface_enabled(
+/* Whether a client can be confined: mapped, on the monitor it is assigned to
+ * and not hidden. The raw scene node state is deliberately not checked, it is
+ * also disabled transiently (animations, overview cards) while the client is
+ * still the focused one. */
+static bool pointer_client_visible(Client *c) {
+	return c && c->mon && !c->mon->isoverview && client_surface(c)->mapped &&
+		   VISIBLEON(c, c->mon);
+}
+
+/* Whether the surface a constraint belongs to can be confined. */
+static bool pointer_constraint_surface_visible(
 	struct wlr_pointer_constraint_v1 *constraint) {
 	Client *c = NULL;
 	LayerSurface *l = NULL;
 
 	toplevel_from_wlr_surface(constraint->surface, &c, &l);
-	if (c && c->scene) {
-		return pointer_node_enabled(c->scene_surface ? &c->scene_surface->node
-													 : &c->scene->node);
+	if (c) {
+		return pointer_client_visible(c);
 	}
 	if (l && l->scene) {
 		return pointer_node_enabled(&l->scene->node);
@@ -141,7 +149,7 @@ static bool pointer_constraint_surface_enabled(
 static void pointer_warp_into_constraint(
 	struct wlr_pointer_constraint_v1 *constraint, Client *c) {
 	if (!c || !c->mon || c->mon->isoverview ||
-		!pointer_constraint_surface_enabled(constraint)) {
+		!pointer_constraint_surface_visible(constraint)) {
 		return;
 	}
 
@@ -187,43 +195,46 @@ pointer_confine_client(struct wlr_pointer_constraint_v1 **constraint_out) {
 
 	if (constraint) {
 		toplevel_from_wlr_surface(constraint->surface, &c, NULL);
-		/* Never confine in overview: the pointer must stay free there. A
-		 * disabled node (hidden tag, hidden scratchpad, ...) must not confine
-		 * either, the client is not on screen. */
-		if (c && c->mon && !c->mon->isoverview &&
-			pointer_constraint_surface_enabled(constraint)) {
+		/* Never confine in overview: the pointer must stay free there. */
+		if (c && pointer_constraint_surface_visible(constraint)) {
 			*constraint_out = constraint;
 			return c;
 		}
 		return NULL;
 	}
 
-	/* Nothing is active: the keyboard focused client may still own a
-	 * constraint (e.g. it was released when entering overview) or ask for
-	 * confinement with the confine_pointer rule. */
+	/* Nothing is active: the focused client may still own a constraint (e.g.
+	 * it was created while the pointer was on another monitor, or released
+	 * when entering overview) or ask for confinement with the confine_pointer
+	 * rule. Both the keyboard focused client and the selected monitor's client
+	 * are considered, the seat focus can still be settling when a client maps. */
 	*constraint_out = NULL;
-	Client *fc = NULL;
+	Client *fc = NULL, *candidates[2] = {NULL, NULL};
 	struct wlr_surface *kbd_focus = server.seat->keyboard_state.focused_surface;
 	if (kbd_focus) {
 		toplevel_from_wlr_surface(kbd_focus, &fc, NULL);
 	}
-	if (!fc || !fc->mon || fc->mon->isoverview || !client_surface(fc)->mapped ||
-		!VISIBLEON(fc, fc->mon) ||
-		!pointer_node_enabled(fc->scene_surface ? &fc->scene_surface->node
-												: &fc->scene->node)) {
-		return NULL;
-	}
+	candidates[0] = fc;
+	candidates[1] = server.selected_monitor ? server.selected_monitor->sel
+											: NULL;
 
-	constraint = wlr_pointer_constraints_v1_constraint_for_surface(
-		server.pointer_constraints, client_surface(fc), server.seat);
-	if (constraint) {
-		pointer_constrain_cursor(constraint);
-		*constraint_out = constraint;
-		return fc;
-	}
+	for (int i = 0; i < 2; i++) {
+		Client *cc = candidates[i];
+		if (!cc || !pointer_client_visible(cc) ||
+			(i == 1 && cc == candidates[0])) {
+			continue;
+		}
 
-	if (fc->confine_pointer) {
-		return fc;
+		constraint = wlr_pointer_constraints_v1_constraint_for_surface(
+			server.pointer_constraints, client_surface(cc), server.seat);
+		if (constraint) {
+			pointer_constrain_cursor(constraint);
+			*constraint_out = constraint;
+			return cc;
+		}
+		if (cc->confine_pointer) {
+			return cc;
+		}
 	}
 
 	return NULL;
@@ -566,18 +577,20 @@ void handle_new_pointer_constraint(struct wl_listener *listener, void *data) {
 		return;
 	}
 
-	/* Otherwise activate it when it belongs to the keyboard focused client: a
-	 * game may grab the pointer while it is still on another monitor (for
-	 * example when it was launched from a launcher there), so no pointer focus
-	 * is on it yet and the selected monitor is not even its monitor. */
-	Client *c = NULL, *cc = NULL;
+	/* Otherwise activate it when it belongs to the focused client: a game may
+	 * grab the pointer while it is still on another monitor (for example when
+	 * it was launched from a launcher there), so no pointer focus is on it yet.
+	 * Both the keyboard focused client and the selected monitor's client are
+	 * considered, the seat focus can still be settling when a client maps. */
+	Client *c = NULL, *cc = NULL, *sel = NULL;
 	if (server.seat->keyboard_state.focused_surface) {
 		toplevel_from_wlr_surface(server.seat->keyboard_state.focused_surface,
 								  &c, NULL);
 	}
+	sel = server.selected_monitor ? server.selected_monitor->sel : NULL;
 	toplevel_from_wlr_surface(pointer_constraint->constraint->surface, &cc,
 							  NULL);
-	if (cc && cc == c) {
+	if (cc && (cc == c || cc == sel)) {
 		pointer_constrain_cursor(pointer_constraint->constraint);
 	}
 }
@@ -859,7 +872,7 @@ void pointer_process_motion(uint32_t time, struct wlr_input_device *device,
 			struct wlr_pointer_constraint_v1 *active = server.active_constraint;
 
 			if (active && active->type == WLR_POINTER_CONSTRAINT_V1_LOCKED &&
-				pointer_constraint_surface_enabled(active) &&
+				pointer_constraint_surface_visible(active) &&
 				(constraint ||
 				 active->surface ==
 					 server.seat->pointer_state.focused_surface)) {
