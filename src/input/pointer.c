@@ -30,9 +30,76 @@
 #include <wlr/types/wlr_relative_pointer_v1.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_virtual_pointer_v1.h>
+#ifdef XWAYLAND
+#include <wlr/xwayland.h>
+#endif
 #include <wlr/util/region.h>
 
 static struct LastCursor last_cursor;
+
+static const char *pc_debug_path = "/tmp/mango-pointer-constraint.log";
+
+static bool pc_debug_stderr(void) {
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = server.cli_debug_log || getenv("MANGO_DEBUG_PC") != NULL;
+	}
+	return enabled;
+}
+
+static void pc_debug_write(const char *fmt, ...) {
+	static bool header_written = false;
+	FILE *f = fopen(pc_debug_path, header_written ? "a" : "w");
+	if (!f) {
+		return;
+	}
+
+	if (header_written) {
+		if (fseek(f, 0, SEEK_END) == 0 && ftell(f) > 1024 * 1024) {
+			fclose(f);
+			return;
+		}
+	} else {
+		header_written = true;
+		fprintf(f, "=== mango %s pointer constraint debug\n", VERSION);
+		Monitor *m;
+		wl_list_for_each(m, &server.monitors, link) {
+			fprintf(f, "=== monitor %s x=%d y=%d %dx%d scale=%.2f\n",
+					m->wlr_output->name, m->m.x, m->m.y, m->m.width, m->m.height,
+					m->wlr_output->scale);
+		}
+	}
+
+	va_list args;
+	va_start(args, fmt);
+	vfprintf(f, fmt, args);
+	va_end(args);
+	fclose(f);
+}
+
+#define PC_DEBUG(...)                                                          \
+	do {                                                                       \
+		pc_debug_write(__VA_ARGS__);                                           \
+		if (pc_debug_stderr()) {                                               \
+			mango_error(false, WLR_DEBUG, __VA_ARGS__);                        \
+		}                                                                      \
+	} while (0)
+
+static const char *pc_client_name(Client *c) {
+	if (!c) {
+		return "(none)";
+	}
+	const char *title = client_get_title(c);
+	return title ? title : "(no-title)";
+}
+
+static const char *pc_client_appid(Client *c) {
+	if (!c) {
+		return "-";
+	}
+	const char *appid = client_get_appid(c);
+	return appid ? appid : "-";
+}
 
 /* X11 clients run with xwayland_ignore_scale render 1:1 physical pixels, so
  * their surface-local coordinates (and therefore any pointer constraint
@@ -142,6 +209,40 @@ static bool pointer_constraint_surface_visible(
 	return false;
 }
 
+static void pc_debug_state(const char *what,
+						   struct wlr_pointer_constraint_v1 *constraint,
+						   Client *c) {
+	static const char *last_what = NULL;
+	static Client *last_client = NULL;
+	static struct wlr_pointer_constraint_v1 *last_constraint = NULL;
+
+	if (last_what == what && last_client == c &&
+		last_constraint == constraint) {
+		return;
+	}
+	last_what = what;
+	last_client = c;
+	last_constraint = constraint;
+
+	PC_DEBUG("PC: %s constraint=%p client=%p %s/%s x11=%d scale=%.2f rule=%d "
+			 "mapped=%d visible=%d overview=%d tags=%u minimized=%d mon=%s | "
+			 "ptr_focus=%p kbd=%p sel=%p cursor=%.1f,%.1f mode=%d\n",
+			 what, (void *)constraint, (void *)c, pc_client_appid(c),
+			 pc_client_name(c), c ? (int)client_is_x11(c) : -1,
+			 c ? pointer_surface_scale(c) : 1.0,
+			 c ? c->confine_pointer : -1,
+			 c ? (int)client_surface(c)->mapped : -1,
+			 c ? (int)pointer_client_visible(c) : -1,
+			 (c && c->mon) ? c->mon->isoverview : -1, c ? c->tags : 0,
+			 c ? (int)c->isminimized : -1,
+			 (c && c->mon) ? c->mon->wlr_output->name : "-",
+			 (void *)server.seat->pointer_state.focused_surface,
+			 (void *)server.seat->keyboard_state.focused_surface,
+			 (void *)(server.selected_monitor ? server.selected_monitor->sel
+											  : NULL),
+			 server.cursor->x, server.cursor->y, server.cursor_mode);
+}
+
 /* Warps the pointer into a constraint that was just activated while it was
  * outside (e.g. the client grabbed the pointer while it was on another
  * monitor). The protocol expects the pointer to be inside the region once the
@@ -200,6 +301,8 @@ pointer_confine_client(struct wlr_pointer_constraint_v1 **constraint_out) {
 			*constraint_out = constraint;
 			return c;
 		}
+		pc_debug_state("ignore-active-constraint", constraint, c);
+		*constraint_out = NULL;
 		return NULL;
 	}
 
@@ -563,19 +666,17 @@ void pointer_create(struct wlr_pointer *pointer) {
 }
 
 void handle_new_pointer_constraint(struct wl_listener *listener, void *data) {
+	struct wlr_pointer_constraint_v1 *constraint = data;
 	PointerConstraint *pointer_constraint =
 		ecalloc(1, sizeof(*pointer_constraint));
-	pointer_constraint->constraint = data;
+	pointer_constraint->constraint = constraint;
 	LISTEN(&pointer_constraint->constraint->events.destroy,
 		   &pointer_constraint->destroy, handle_pointer_constraint_destroy);
 
 	// layer surfaces are never selected_monitor->sel, so match pointer focus
 	// too (e.g. lan-mouse locks the pointer on a 1px layer surface)
-	if (server.seat->pointer_state.focused_surface ==
-		pointer_constraint->constraint->surface) {
-		pointer_constrain_cursor(pointer_constraint->constraint);
-		return;
-	}
+	bool pointer_match = server.seat->pointer_state.focused_surface ==
+						 constraint->surface;
 
 	/* Otherwise activate it when it belongs to the focused client: a game may
 	 * grab the pointer while it is still on another monitor (for example when
@@ -588,16 +689,76 @@ void handle_new_pointer_constraint(struct wl_listener *listener, void *data) {
 								  &c, NULL);
 	}
 	sel = server.selected_monitor ? server.selected_monitor->sel : NULL;
-	toplevel_from_wlr_surface(pointer_constraint->constraint->surface, &cc,
-							  NULL);
-	if (cc && (cc == c || cc == sel)) {
-		pointer_constrain_cursor(pointer_constraint->constraint);
+	toplevel_from_wlr_surface(constraint->surface, &cc, NULL);
+
+	bool activate = pointer_match || (cc && (cc == c || cc == sel));
+	PC_DEBUG("PC: new %s %p type=%d lifetime=%d surface=%p client=%p %s/%s "
+			 "x11=%d scale=%.2f mapped=%d visible=%d overview=%d tags=%u "
+			 "minimized=%d mon=%s monrect=%d,%d %dx%d monscale=%.2f | "
+			 "pointer_match=%d kbd=%p(%s) sel=%p(%s) active=%p "
+			 "region_empty=%d region=%d,%d %d,%d "
+			 "cursor=%.1f,%.1f mode=%d -> activate=%d\n",
+			 constraint->type == WLR_POINTER_CONSTRAINT_V1_LOCKED ? "lock"
+																  : "confine",
+			 (void *)constraint, constraint->type, constraint->lifetime,
+			 (void *)constraint->surface, (void *)cc,
+			 pc_client_appid(cc), pc_client_name(cc),
+			 cc ? (int)client_is_x11(cc) : -1,
+			 cc ? pointer_surface_scale(cc) : 1.0,
+			 cc ? (int)client_surface(cc)->mapped : -1,
+			 cc ? (int)pointer_client_visible(cc) : -1,
+			 (cc && cc->mon) ? cc->mon->isoverview : -1, cc ? cc->tags : 0,
+			 cc ? (int)cc->isminimized : -1,
+			 (cc && cc->mon) ? cc->mon->wlr_output->name : "-",
+			 (cc && cc->mon) ? cc->mon->m.x : 0,
+			 (cc && cc->mon) ? cc->mon->m.y : 0,
+			 (cc && cc->mon) ? cc->mon->m.width : 0,
+			 (cc && cc->mon) ? cc->mon->m.height : 0,
+			 (cc && cc->mon) ? cc->mon->wlr_output->scale : 0.0,
+			 (int)pointer_match,
+			 (void *)server.seat->keyboard_state.focused_surface,
+			 pc_client_name(c), (void *)sel, pc_client_name(sel),
+			 (void *)server.active_constraint,
+			 (int)pixman_region32_empty(&constraint->region),
+			 pixman_region32_extents(&constraint->region)->x1,
+			 pixman_region32_extents(&constraint->region)->y1,
+			 pixman_region32_extents(&constraint->region)->x2,
+			 pixman_region32_extents(&constraint->region)->y2,
+			 server.cursor->x, server.cursor->y, server.cursor_mode,
+			 (int)activate);
+
+#ifdef XWAYLAND
+	if (cc && client_is_x11(cc)) {
+		struct wlr_xwayland_surface *xs = cc->surface.xwayland;
+		PC_DEBUG("PC:   x11 window %dx%d at %d,%d (override_redirect=%d) "
+				 "geom=%d,%d %dx%d bw=%u\n",
+				 xs->width, xs->height, xs->x, xs->y,
+				 (int)xs->override_redirect, cc->geom.x, cc->geom.y,
+				 cc->geom.width, cc->geom.height, cc->bw);
+	}
+#endif
+
+	if (activate) {
+		pointer_constrain_cursor(constraint);
 	}
 }
 
 void pointer_constrain_cursor(struct wlr_pointer_constraint_v1 *constraint) {
 	if (server.active_constraint == constraint)
 		return;
+
+	Client *old_client = NULL, *new_client = NULL;
+	if (server.active_constraint) {
+		toplevel_from_wlr_surface(server.active_constraint->surface,
+								  &old_client, NULL);
+	}
+	if (constraint) {
+		toplevel_from_wlr_surface(constraint->surface, &new_client, NULL);
+	}
+	PC_DEBUG("PC: active %p(%s) -> %p(%s) (%s)\n",
+			 (void *)server.active_constraint, pc_client_name(old_client),
+			 (void *)constraint, pc_client_name(new_client),
+			 constraint ? "activate" : "release");
 
 	if (server.active_constraint) {
 		if (constraint == NULL) {
@@ -613,6 +774,14 @@ void pointer_constrain_cursor(struct wlr_pointer_constraint_v1 *constraint) {
 
 		Client *c = NULL;
 		toplevel_from_wlr_surface(constraint->surface, &c, NULL);
+		PC_DEBUG("PC: activate warp check client=%p %s geom=%d,%d %dx%d "
+				 "bw=%u hint=%d cursor=%.1f,%.1f region_empty=%d\n",
+				 (void *)c, pc_client_name(c), c ? c->geom.x : 0,
+				 c ? c->geom.y : 0, c ? c->geom.width : 0,
+				 c ? c->geom.height : 0, c ? c->bw : 0,
+				 (int)constraint->current.cursor_hint.enabled, server.cursor->x,
+				 server.cursor->y,
+				 (int)pixman_region32_empty(&constraint->region));
 		pointer_warp_into_constraint(constraint, c);
 	}
 }
@@ -653,6 +822,14 @@ void handle_pointer_constraint_destroy(struct wl_listener *listener,
 									   void *data) {
 	PointerConstraint *pointer_constraint =
 		wl_container_of(listener, pointer_constraint, destroy);
+
+	Client *c = NULL;
+	toplevel_from_wlr_surface(pointer_constraint->constraint->surface, &c,
+							  NULL);
+	PC_DEBUG("PC: destroy constraint=%p client=%p %s/%s active=%d\n",
+			 (void *)pointer_constraint->constraint, (void *)c,
+			 pc_client_appid(c), pc_client_name(c),
+			 server.active_constraint == pointer_constraint->constraint);
 
 	if (server.active_constraint == pointer_constraint->constraint) {
 		pointer_warp_to_constraint_hint();
@@ -879,6 +1056,7 @@ void pointer_process_motion(uint32_t time, struct wlr_input_device *device,
 				/* The client owns the pointer: keep it at the position the
 				 * client wants, so a cursor left outside comes back. */
 				double lx, ly;
+				pc_debug_state("motion-locked-freeze", active, cc);
 				if (cc && pointer_constraint_hint_position(cc, &lx, &ly) &&
 					(server.cursor->x < cc->geom.x ||
 					 server.cursor->y < cc->geom.y ||
@@ -894,6 +1072,7 @@ void pointer_process_motion(uint32_t time, struct wlr_input_device *device,
 				pixman_region32_t fallback;
 				pixman_region32_t *region =
 					pointer_constraint_region(constraint, cc, &fallback);
+				pixman_box32_t *ext = pixman_region32_extents(region);
 				/* The confinement region uses surface coordinates while the
 				 * cursor position and the delta are in layout coordinates. */
 				sx = (server.cursor->x - cc->geom.x - cc->bw) * scale;
@@ -903,10 +1082,27 @@ void pointer_process_motion(uint32_t time, struct wlr_input_device *device,
 									   &sy_confined)) {
 					dx = (sx_confined - sx) / scale;
 					dy = (sy_confined - sy) / scale;
+					pc_debug_state("motion-confine-clamp", constraint, cc);
+					PC_DEBUG("PC:   clamp scale=%.2f geom=%d,%d %dx%d s=%.1f,%.1f "
+							 "in=%.1f,%.1f out=%.1f,%.1f region=%d,%d %d,%d "
+							 "(empty=%d)\n",
+							 scale, cc->geom.x, cc->geom.y, cc->geom.width,
+							 cc->geom.height, sx, sy, dx, dy, sx_confined,
+							 sy_confined, ext->x1, ext->y1, ext->x2, ext->y2,
+							 (int)pixman_region32_empty(region));
 				} else {
 					/* The pointer is outside the region (e.g. the client warped
 					 * it away or it was left on another monitor). Warp it back
 					 * instead of letting it escape. */
+					pc_debug_state("motion-confine-outside-region", constraint,
+								   cc);
+					PC_DEBUG("PC:   outside scale=%.2f geom=%d,%d %dx%d "
+							 "s=%.1f,%.1f region=%d,%d %d,%d (empty=%d) "
+							 "cursor=%.1f,%.1f\n",
+							 scale, cc->geom.x, cc->geom.y, cc->geom.width,
+							 cc->geom.height, sx, sy, ext->x1, ext->y1, ext->x2,
+							 ext->y2, (int)pixman_region32_empty(region),
+							 server.cursor->x, server.cursor->y);
 					pointer_region_closest_point(region, sx, sy, &sx_confined,
 												 &sy_confined);
 					wlr_cursor_warp(server.cursor, NULL,
@@ -918,6 +1114,8 @@ void pointer_process_motion(uint32_t time, struct wlr_input_device *device,
 				if (region == &fallback) {
 					pixman_region32_fini(&fallback);
 				}
+			} else {
+				pc_debug_state("motion-no-target", active, NULL);
 			}
 		}
 
