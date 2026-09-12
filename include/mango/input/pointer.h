@@ -51,6 +51,7 @@ void configure_pointer(struct wlr_input_device *wlr_device,
 void pointer_create(struct wlr_pointer *pointer);
 void handle_new_pointer_constraint(struct wl_listener *listener, void *data);
 void pointer_constrain_cursor(struct wlr_pointer_constraint_v1 *constraint);
+void pointer_debug_client(const char *what, Client *c);
 void handle_cursor_frame(struct wl_listener *listener, void *data);
 void pointer_warp_to_constraint_hint(void);
 void handle_drag_icon_destroy(struct wl_listener *listener, void *data);

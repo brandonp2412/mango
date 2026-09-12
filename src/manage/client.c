@@ -1812,6 +1812,16 @@ bool xwayland_scene_buffer_point_accepts_input(struct wlr_scene_buffer *buffer,
 		}
 #endif
 	}
+	{
+		struct wlr_surface *s = scene_surface->surface;
+		pixman_box32_t *ie = pixman_region32_extents(&s->input_region);
+		mango_error(false, WLR_DEBUG,
+					"PC: hittest local=%.2f,%.2f tx=%.2f,%.2f surf=%dx%d "
+					"input=%d,%d %d,%d accept=%d\n",
+					*sx, *sy, tx, ty, s->current.width, s->current.height,
+					ie->x1, ie->y1, ie->x2, ie->y2,
+					(int)wlr_surface_point_accepts_input(s, tx, ty));
+	}
 	return wlr_surface_point_accepts_input(scene_surface->surface, tx, ty);
 }
 
@@ -1976,6 +1986,8 @@ handle_client_map(struct wl_listener *listener, void *data) {
 	Client *at_client = NULL;
 	Client *c = wl_container_of(listener, c, map);
 	int32_t i = 0;
+
+	pointer_debug_client("map", c);
 
 	c->id = generate_client_id();
 
@@ -2218,6 +2230,7 @@ void handle_client_unmap(struct wl_listener *listener, void *data) {
 	/* Called when the surface is unmapped, and should no longer be shown.
 	 */
 	Client *c = wl_container_of(listener, c, unmap);
+	pointer_debug_client("unmap", c);
 	Monitor *m = NULL;
 	Client *nextfocus = NULL;
 	c->iskilling = 1;
@@ -2548,6 +2561,20 @@ void client_set_opacity(Client *c, double opacity) {
 								   scene_buffer_apply_opacity, &opacity);
 }
 
+void client_ensure_constraint(Client *c) {
+	if (!c || !client_surface(c)) {
+		return;
+	}
+	struct wlr_pointer_constraint_v1 *constraint;
+	wl_list_for_each(constraint, &server.pointer_constraints->constraints,
+					 link) {
+		if (constraint->surface == client_surface(c)) {
+			pointer_constrain_cursor(constraint);
+			break;
+		}
+	}
+}
+
 void client_focus(Client *c, int32_t lift) {
 
 	Client *last_focus_client = NULL;
@@ -2577,8 +2604,10 @@ void client_focus(Client *c, int32_t lift) {
 	}
 
 	if (c && client_surface(c) == old_keyboard_focus_surface &&
-		server.selected_monitor && server.selected_monitor->sel)
+		server.selected_monitor && server.selected_monitor->sel) {
+		client_ensure_constraint(c);
 		return;
+	}
 
 	if (server.selected_monitor && server.selected_monitor->sel &&
 		server.selected_monitor->sel != c &&
@@ -2687,6 +2716,7 @@ void client_focus(Client *c, int32_t lift) {
 		// clear text input focus state
 		mango_im_relay_set_focus(server.input_method_relay, NULL);
 		wlr_seat_keyboard_notify_clear_focus(server.seat);
+		pointer_debug_client("kbd-clear", NULL);
 		check_vrr_enable(c);
 		if (server.active_constraint) {
 			pointer_constrain_cursor(NULL);
@@ -2704,6 +2734,7 @@ void client_focus(Client *c, int32_t lift) {
 
 	/* Have a client, so focus its top-level wlr_surface */
 	client_notify_enter(client_surface(c), wlr_seat_get_keyboard(server.seat));
+	pointer_debug_client("kbd-focus", c);
 
 	/* Activate the new client */
 	client_activate_surface(client_surface(c), 1);
@@ -2713,14 +2744,7 @@ void client_focus(Client *c, int32_t lift) {
 		pointer_constrain_cursor(NULL);
 	}
 
-	struct wlr_pointer_constraint_v1 *constraint;
-	wl_list_for_each(constraint, &server.pointer_constraints->constraints,
-					 link) {
-		if (constraint->surface == client_surface(c)) {
-			pointer_constrain_cursor(constraint);
-			break;
-		}
-	}
+	client_ensure_constraint(c);
 }
 
 void client_active(Client *c) {

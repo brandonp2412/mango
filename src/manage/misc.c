@@ -308,6 +308,14 @@ void node_at_point(double x, double y, struct wlr_surface **psurface,
 	if (gb)
 		*gb = mangogroupbar;
 
+	if (!surface) {
+		mango_error(false, WLR_DEBUG,
+					"PC: node-miss detail x=%.2f y=%.2f layer=%d node=%p "
+					"type=%d data=%p c=%p l=%p\n",
+					x, y, layer, (void *)node, node ? (int)node->type : -1,
+					node ? node->data : NULL, (void *)c, (void *)l);
+	}
+
 	if (server.selected_monitor && server.selected_monitor->isoverview) {
 		ovc = client_at_point(x, y);
 
